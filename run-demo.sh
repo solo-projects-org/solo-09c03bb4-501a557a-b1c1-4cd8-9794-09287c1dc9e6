@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 docker compose up -d --build
 
 echo "Waiting for services to become healthy..."
-for port in 8001 8011 8012; do
+for port in 8001 8021 8011 8012; do
   for _ in $(seq 1 30); do
     if curl -fsS "http://localhost:${port}/health" >/dev/null 2>&1; then break; fi
     sleep 1
@@ -16,3 +16,4 @@ for port in 8001 8011 8012; do
 done
 
 python3 -I demo/demo.py
+python3 -I tests/test_delivery.py

@@ -12,6 +12,9 @@ Scenarios:
   3. Two web processes collecting the same day -> only one runs; plus an
      end-to-end stale-revision check proving a late lower revision can never
      overwrite a newer published revision, plus a direct DB-guard unit check.
+  4. Delivery to the local receiving end: automatic sync after publish,
+     idempotent re-send, stale revision rejection at the receiver, retry after
+     an outage, and "a failed send never removes the local published day".
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "web"))  # db.py is stdlib-only, safe under -I
+sys.path.insert(0, str(ROOT))  # receiver store is stdlib-only too
 
 RESULTS: list[tuple[bool, str]] = []
 
@@ -131,8 +135,108 @@ def scenario_mid_correction(station: str, web: str, section: str, date: str) -> 
           "同修订号重复采集幂等成功")
 
 
+def scenario_sync(station: str, web1: str, web2: str, receiver: str,
+                  section: str, date: str) -> None:
+    print("\n=== 场景 4：整日发布后投送本地接收端 ===")
+    reset_day(station, section, date)
+
+    status, started = request("POST", f"{web1}/api/collect", {"section": section, "date": date})
+    check(status == 202, "启动采集")
+    run = wait_run(web1, started["run_id"])
+    check(run["status"] == "success", "整日采集成功")
+
+    # The local day is available immediately, independent of delivery.
+    published = published_or_none(web1, section, date)
+    check(published is not None and published["revision"] == 1,
+          "本地已发布修订号 1")
+
+    sync = wait_sync(web1, section, date)
+    check(sync["sync_state"] == "synced", "发布后自动同步到接收端", str(sync.get("sync_state")))
+    check(sync["current_delivery"] is not None
+          and sync["current_delivery"]["status"] == "sent",
+          "当前修订的投递状态为 sent")
+    check(sync["receiver_revision"] == 1 and sync["receiver_matches"],
+          "接收端存有同一修订号的完整日档")
+
+    status, day = request("GET", f"{receiver}/api/days/{section}/{date}")
+    check(status == 200 and day["revision"] == 1 and day["row_count"] == 24,
+          "接收端只开放完整日档（24 行）",
+          json.dumps({k: day.get(k) for k in ("revision", "row_count")}) if status == 200 else "")
+
+    # Idempotent re-send: same revision, same bytes -> duplicate, not a rewrite.
+    status, retry = request("POST", f"{web2}/api/sync/retry",
+                            {"section": section, "date": date})
+    check(status == 200 and retry["status"] == "sent",
+          "另一 Web 实例重试已同步修订为幂等空操作", json.dumps(retry.get("acknowledgment")))
+    status, dup = request("POST", f"{receiver}/api/deliveries", published_payload(
+        web1, section, date))
+    check(status == 200 and dup["status"] == "duplicate",
+          "接收端把同版同内容重送视为幂等（duplicate，不重复写入）",
+          json.dumps(dup))
+    status, day = request("GET", f"{receiver}/api/days/{section}/{date}")
+    check(day["revision"] == 1 and day["row_count"] == 24,
+          "重送后接收端日档不变（无重复写入）")
+
+    # A failed send must not remove the locally published day; the local day
+    # stays visible on *both* web instances regardless of delivery state.
+    check(published_or_none(web1, section, date)["revision"] == 1
+          and published_or_none(web2, section, date)["revision"] == 1,
+          "发送尝试不影响本地已发布日档")
+
+    # New correction -> new revision -> only the newest is eligible and the
+    # receiver's day is replaced as a whole.
+    request("POST", f"{station}/admin/correct",
+            {"section": section, "date": date, "time": "09:00", "nh3n": 6.543})
+    status, started = request("POST", f"{web2}/api/collect", {"section": section, "date": date})
+    check(status == 202, "另一实例采集修订号 2")
+    run = wait_run(web2, started["run_id"])
+    check(run["status"] == "success" and run["revision"] == 2, "采集并发布修订号 2")
+    sync = wait_sync(web1, section, date)
+    check(sync["sync_state"] == "synced" and sync["receiver_revision"] == 2,
+          "新修订自动补送，接收端为修订号 2", str(sync.get("sync_state")))
+    status, day = request("GET", f"{receiver}/api/days/{section}/{date}")
+    check(day["revision"] == 2, "接收端日档被整日替换为修订号 2")
+    row9 = next(r for r in day["rows"] if r["time"] == "09:00")
+    check(row9["nh3n"] == 6.543, "更正后的数值已送达", json.dumps(row9))
+    status, sync = request("GET", f"{web1}/api/sync?section={section}&date={date}")
+    old = [d for d in sync["deliveries"] if d["revision"] == 1]
+    check(old and old[0]["status"] == "sent",
+          "旧修订保留历史投递记录，且不被显示为当前已同步",
+          json.dumps(old))
+
+
+def scenario_receiver_guards(receiver: str, section: str, date: str) -> None:
+    print("\n=== 场景 5：接收端完整性 / 幂等 / 迟修订防护 ===")
+    def raw_delivery(payload: dict) -> tuple[int, dict]:
+        return request("POST", f"{receiver}/api/deliveries", payload)
+
+    good = build_test_payload(section, date, 5, 1.234)
+    s, body = raw_delivery(good)
+    check(s == 200 and body["status"] == "created", "接收端接受修订号 5 的完整日档",
+          json.dumps(body))
+    s, body = raw_delivery(build_test_payload(section, date, 3, 0.5))
+    check(s == 409 and body.get("detail", {}).get("error") == "stale_revision",
+          "迟到的旧修订号被接收端拒绝", json.dumps(body))
+    s, day = request("GET", f"{receiver}/api/days/{section}/{date}")
+    check(day["revision"] == 5, "接收端仍保持较新修订号 5")
+    s, body = raw_delivery(good)
+    check(s == 200 and body["status"] == "duplicate",
+          "同版同内容重送幂等（duplicate）", json.dumps(body))
+    s, body = raw_delivery(build_test_payload(section, date, 5, 9.876))
+    check(s == 409 and body.get("detail", {}).get("error") == "revision_conflict",
+          "同修订号不同内容被拒绝为冲突", json.dumps(body))
+    bad = build_test_payload(section, date, 6, 1.0)
+    bad["rows"] = bad["rows"][:23]
+    bad["row_count"] = 23
+    s, body = raw_delivery(bad)
+    check(s == 400 and body.get("detail", {}).get("error") == "incomplete_day",
+          "不完整日档（缺整点）被接收端拒绝", json.dumps(body))
+    s, body = request("GET", f"{receiver}/api/days/{section}/{date}")
+    check(body["revision"] == 5 and body["row_count"] == 24,
+          "被拒绝的投递不影响接收端既有完整日档")
+
+
 def scenario_read_failure(station: str, web: str, section: str, date: str) -> None:
-    print("\n=== 场景 2：页读取失败，仅重试当前页后成功 ===")
     reset_day(station, section, date)
     request("POST", f"{station}/admin/fail-next",
             {"section": section, "date": date})
@@ -223,22 +327,81 @@ def scenario_concurrency(station: str, web1: str, web2: str, section: str, date:
         Path(str(tmp) + suffix).unlink(missing_ok=True)
 
 
+def wait_sync(web: str, section: str, date: str, timeout: float = 20.0) -> dict:
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        status, last = request("GET", f"{web}/api/sync?section={section}&date={date}")
+        if status == 200 and last.get("sync_state") == "synced":
+            return last
+        time.sleep(0.4)
+    return last
+
+
+def published_payload(web: str, section: str, date: str) -> dict:
+    """Rebuild exactly what the sender would transmit, for idempotency checks."""
+    from receiver.app.store import content_digest
+
+    status, published = request("GET", f"{web}/api/published?section={section}&date={date}")
+    if status != 200:
+        raise AssertionError(f"no published day: {status}")
+    rows = [
+        {"time": r["time"], "nh3n": r["nh3n"], "source_page": r["source_page"]}
+        for r in published["rows"]
+    ]
+    return {
+        "section": section,
+        "date": date,
+        "revision": published["revision"],
+        "complete": True,
+        "row_count": len(rows),
+        "digest": content_digest(section, date, published["revision"], rows),
+        "published_at": published["published_at"],
+        "published_by": published["published_by"],
+        "rows": rows,
+    }
+
+
+def build_test_payload(section: str, date: str, revision: int, value: float) -> dict:
+    from receiver.app.store import content_digest
+
+    rows = [{"time": f"{h:02d}:00", "nh3n": value, "source_page": 1} for h in range(24)]
+    return {
+        "section": section,
+        "date": date,
+        "revision": revision,
+        "complete": True,
+        "row_count": 24,
+        "digest": content_digest(section, date, revision, rows),
+        "published_at": "2026-11-15T00:00:00+00:00",
+        "published_by": "demo",
+        "rows": rows,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Water-quality platform demo")
     parser.add_argument("--station", default="http://localhost:8001")
     parser.add_argument("--web1", default="http://localhost:8011")
     parser.add_argument("--web2", default="http://localhost:8012")
+    parser.add_argument("--receiver", default="http://localhost:8021")
     parser.add_argument("--section", default="SECTION-A")
     parser.add_argument("--date1", default="2026-11-13")
     parser.add_argument("--date2", default="2026-11-12")
     parser.add_argument("--date3", default="2026-11-11")
+    parser.add_argument("--date4", default="2026-11-10")
+    parser.add_argument("--date5", default="2026-11-09")
     args = parser.parse_args()
 
-    print(f"station={args.station} web1={args.web1} web2={args.web2}")
+    print(f"station={args.station} web1={args.web1} web2={args.web2} "
+          f"receiver={args.receiver}")
     try:
         scenario_mid_correction(args.station, args.web1, args.section, args.date1)
         scenario_read_failure(args.station, args.web1, args.section, args.date2)
         scenario_concurrency(args.station, args.web1, args.web2, args.section, args.date3)
+        scenario_sync(args.station, args.web1, args.web2, args.receiver,
+                      args.section, args.date4)
+        scenario_receiver_guards(args.receiver, args.section, args.date5)
     except Exception as exc:
         print(f"\n演示中断: {exc!r}")
         return 1

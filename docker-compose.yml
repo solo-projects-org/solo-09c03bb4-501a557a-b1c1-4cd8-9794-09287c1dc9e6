@@ -19,6 +19,7 @@ services:
     environment:
       DB_PATH: /data/quality.db
       STATION_URL: http://station:8000
+      RECEIVER_URL: http://receiver:8000
       WORKER_NAME: web1
     ports:
       - "8011:8000"
@@ -26,6 +27,8 @@ services:
       - quality-data:/data
     depends_on:
       station:
+        condition: service_healthy
+      receiver:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
@@ -38,6 +41,7 @@ services:
     environment:
       DB_PATH: /data/quality.db
       STATION_URL: http://station:8000
+      RECEIVER_URL: http://receiver:8000
       WORKER_NAME: web2
     ports:
       - "8012:8000"
@@ -46,6 +50,22 @@ services:
     depends_on:
       station:
         condition: service_healthy
+      receiver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  receiver:
+    build: ./receiver
+    environment:
+      RECEIVER_DB_PATH: /data/receiver.db
+    ports:
+      - "8021:8000"
+    volumes:
+      - receiver-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
       interval: 5s
@@ -54,3 +74,4 @@ services:
 
 volumes:
   quality-data:
+  receiver-data:
